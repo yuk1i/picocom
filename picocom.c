@@ -37,6 +37,8 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <limits.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #ifdef USE_FLOCK
 #include <sys/file.h>
 #endif
@@ -212,6 +214,7 @@ struct {
     int emap;
     char *log_filename;
     char *initstring;
+    char *unix_socket;
     int exit_after;
     int exit;
     int lower_rts;
@@ -242,6 +245,7 @@ struct {
     .emap = M_E_DFL,
     .log_filename = NULL,
     .initstring = NULL,
+    .unix_socket = NULL,
     .exit_after = -1,
     .exit = 0,
     .lower_rts = 0,
@@ -259,6 +263,8 @@ int sig_exit = 0;
 
 int tty_fd = -1;
 int log_fd = -1;
+int socket_fd = -1;
+int monitor_fd = -1;
 
 /* RTS and DTR are usually raised upon opening the serial port (at least
    as tested on Linux, OpenBSD and macOS, but FreeBSD behave different) */
@@ -698,6 +704,10 @@ cleanup (int drain, int noreset, int hup)
     if ( opts.initstring ) {
         free(opts.initstring);
         opts.initstring = NULL;
+    }
+    if ( opts.unix_socket ) {
+        free(opts.unix_socket);
+        opts.unix_socket = NULL;
     }
     if ( tty_q.buff ) {
         free(tty_q.buff);
@@ -1404,6 +1414,10 @@ enum le_reason {
     LE_SIGNAL
 };
 
+static int max(int a, int b) {
+    return a < b ? b : a;
+}
+
 enum le_reason
 loop(void)
 {
@@ -1411,7 +1425,7 @@ loop(void)
         ST_COMMAND,
         ST_TRANSPARENT
     } state;
-    fd_set rdset, wrset;
+    fd_set rdset, wrset, errorset;
     int r, n;
     int stdin_closed;
 
@@ -1427,8 +1441,11 @@ loop(void)
         ptv = NULL;
         FD_ZERO(&rdset);
         FD_ZERO(&wrset);
+        FD_ZERO(&errorset);
         if ( ! stdin_closed ) FD_SET(STI, &rdset);
         if ( ! opts.exit ) FD_SET(tty_fd, &rdset);
+        if ( socket_fd != -1 ) FD_SET(socket_fd, &rdset);
+        if ( monitor_fd != -1) FD_SET(monitor_fd, &rdset);
         if ( tty_q.len ) {
             FD_SET(tty_fd, &wrset);
         } else {
@@ -1442,7 +1459,11 @@ loop(void)
             }
         }
 
-        r = select(tty_fd + 1, &rdset, &wrset, NULL, ptv);
+        int select_fd = max(tty_fd, socket_fd);
+        select_fd = max(select_fd, monitor_fd);
+        // printf("tty_fd: %d, ")
+
+        r = select(select_fd + 1, &rdset, &wrset, &errorset, ptv);
         if ( r < 0 )  {
             if ( errno == EINTR )
                 continue;
@@ -1452,6 +1473,46 @@ loop(void)
         if ( r == 0 ) {
             /* Idle timeout expired */
             return LE_IDLE;
+        }
+
+        if (FD_ISSET(socket_fd, &rdset)) {
+            if (monitor_fd == -1) {
+                monitor_fd = accept(socket_fd, NULL, NULL);
+                pinfo("\r\n** monitor connected. **\r\n");
+            }
+            int fd;
+            while((fd = accept(socket_fd, NULL, NULL)) > 0) {
+                close(fd);
+            }
+        }
+
+        if (FD_ISSET(monitor_fd, &rdset)) {
+            /* read from monitor*/
+            char buff_rd[128];
+            int i;
+            
+            do {
+                n = read(monitor_fd, buff_rd, sizeof(buff_rd));
+            } while (n < 0 && errno == EINTR);
+            if (n <= 0) {
+                FD_CLR(monitor_fd, &rdset);
+                close(monitor_fd);
+                monitor_fd = -1;
+                pinfo("\r\n** monitor closed. **\r\n");
+            } else {
+                printf("\r\n** monitor: %s **\r\n", buff_rd);
+                for ( i = 0; i < n; i++ ) {
+                    unsigned char c = buff_rd[i];
+                    tty_q_push((char *)&c, 1);
+                }
+            }
+        }
+
+        if (FD_ISSET(monitor_fd, &errorset)) {
+            FD_CLR(monitor_fd, &rdset);
+            close(monitor_fd);
+            monitor_fd = -1;
+            pinfo("\r\n** monitor closed. ** \r\n");
         }
 
         if ( FD_ISSET(STI, &rdset) ) {
@@ -1533,6 +1594,14 @@ loop(void)
                 n = bmp - buff_map;
                 if ( writen_ni(STO, buff_map, n) < n )
                     fatal("write to stdout failed: %s", strerror(errno));
+                if (monitor_fd != -1){
+                    if (writen_ni(monitor_fd, buff_map, n) < n) {
+                        FD_CLR(monitor_fd, &rdset);
+                        close(monitor_fd);
+                        monitor_fd = -1;
+                        pinfo("\r\n** monitor closed. ** \r\n");
+                    }
+                }
             }
         }
 
@@ -1651,6 +1720,7 @@ show_usage(char *name)
     printf("  --emap <map> (local-echo mappings)\n");
     printf("  --lo<g>file <filename>\n");
     printf("  --inits<t>ring <string>\n");
+    printf("  --unixsocket <path>\n");
     printf("  --e<x>it-after <msec>\n");
     printf("  --e<X>it\n");
     printf("  --lower-rts\n");
@@ -1711,6 +1781,7 @@ parse_args(int argc, char *argv[])
         {"logfile", required_argument, 0, 'g'},
         {"initstring", required_argument, 0, 't'},
         {"exit-after", required_argument, 0, 'x'},
+        {"unixsocket", required_argument, 0, 'k'},
         {"exit", no_argument, 0, 'X'},
         {"lower-rts", no_argument, 0, 1},
         {"lower-dtr", no_argument, 0, 2},
@@ -1883,6 +1954,10 @@ parse_args(int argc, char *argv[])
             if ( opts.initstring ) free(opts.initstring);
             opts.initstring = strdup(optarg);
             break;
+        case 'k':
+            if ( opts.unix_socket ) free(opts.unix_socket);
+            opts.unix_socket = strdup(optarg);
+            break;
         case 1:
             opts.lower_rts = 1;
             break;
@@ -1984,6 +2059,11 @@ parse_args(int argc, char *argv[])
                (unsigned long)strlen(opts.initstring));
     } else {
         printf("initstring     : none\n");
+    }
+    if ( opts.unix_socket ) {
+        printf("unix_socket    : %s\n", opts.unix_socket);
+    } else {
+        printf("unix_socket    : none\n");
     }
     if (opts.exit_after < 0) {
         printf("exit_after is  : not set\n");
@@ -2171,6 +2251,35 @@ main (int argc, char *argv[])
               KEYC(opts.escape), KEYC(KEY_HELP));
     }
 #endif
+
+    if ( opts.unix_socket ) {
+        if (access(opts.unix_socket, F_OK) == 0) {
+            if (unlink(opts.unix_socket) != 0) {
+                fatal("cannot delete unix_socket %s\n", opts.unix_socket);
+            }
+        }
+        socket_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+        struct sockaddr_un name;
+        memset(&name, 0, sizeof(name));
+        name.sun_family = AF_UNIX;
+        strncpy(name.sun_path, opts.unix_socket, sizeof(name.sun_path) - 1);
+        int ret = bind(socket_fd, (const struct sockaddr*) &name, sizeof(name));
+        if (ret == -1) {
+            fatal("monitor socket bind failed.\n");
+        }
+        ret = listen(socket_fd, 20);
+        if (ret == -1) {
+            fatal("monitor socket listen failed.\n");
+        }
+        int flags = fcntl(socket_fd, F_GETFL, 0);
+        if (flags == -1 )
+            perror("fcntl get");
+        flags |= O_NONBLOCK;
+        flags = fcntl(socket_fd, F_SETFL, flags);
+        if (flags == -1)
+            perror("fcntl set");
+    }
+
     pinfo("Terminal ready\r\n");
 
     /* Enter main processing loop */
@@ -2184,6 +2293,18 @@ main (int argc, char *argv[])
         cleanup(0 /* drain */, opts.noreset, opts.hangup);
     else
         cleanup(1 /* drain */, opts.noreset, opts.hangup);
+
+    if (monitor_fd != -1) {
+        close(monitor_fd);
+    }
+    if (socket_fd != -1) {
+        close(socket_fd);
+    }
+    if (opts.unix_socket) {
+        if (unlink(opts.unix_socket) != 0) {
+            perror("unlink");
+        }
+    }
 
     if ( ler == LE_SIGNAL ) {
         pinfo("Picocom was killed\r\n");
