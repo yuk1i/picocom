@@ -5,6 +5,19 @@ by Nick Patavalis (npat@efault.net)
 
 The latest release can be downloaded from:
 
+
+## Yuki's Notes
+
+改过的 picocom，增加了一个unix socket的monitor功能，可以把所有串口上的收发原样转发到unix-socket上
+
+用于自动化在uboot中装载内核
+
+`./picocom --baud 115200 --unixsocket pico-socket` 会在当前目录下新建一个 unix-socket 叫 pico-socket
+
+用 `nc -v -U pico-socket` 即可打开
+
+## Readme cont.
+
 > https://github.com/npat-efault/picocom/releases
 
 As its name suggests, *picocom* is a minimal dumb-terminal emulation
